@@ -8,7 +8,7 @@
 #include "aht20.h"
 #include "bmp280.h"
 #include "ssd1306.h"
-#include <alerts.h>
+#include "alerts.h"
 
 // GPIO utilizada
 #define LED_RED 13
@@ -35,11 +35,13 @@ ssd1306_t ssd;
 #define I2C_SCL 1
 #define SEA_LEVEL_PRESSURE 101325.0 // Pressão ao nível do mar em Pa
 
+// Struct para enviar os dados para outro Core
+typedef union {
+    float f;
+    uint32_t u;
+} float_u32_t;
+
 // Estrutura para armazenar os dados dos sensores
-AHT20_data_t AHT20_data;
-BMP280_data_t BMP280_data;
-int32_t raw_temp_bmp;
-int32_t raw_pressure;
 ConfigParams_t config_params;
 Sensor_alerts_t sensor_alerts = {false, false, false, false};
 
@@ -100,11 +102,29 @@ void core1_entry(){
 
     // Display
     while(true){
+        BMP280_data_t BMP280_data;
+        AHT20_data_t AHT20_data;
+
+        float_u32_t conv;
+        conv.u = multicore_fifo_pop_blocking();
+        float aht_temp = conv.f;
+        conv.u = multicore_fifo_pop_blocking();
+        float aht_humi = conv.f;
+        conv.u = multicore_fifo_pop_blocking();
+        float bmp_press = conv.f;
+        conv.u = multicore_fifo_pop_blocking();
+        float bmp_temp = conv.f;
+
+        BMP280_data.temperature = bmp_temp;
+        BMP280_data.pressure = bmp_press;
+        AHT20_data.temperature = aht_temp;
+        AHT20_data.humidity = aht_humi;
+
         printf("[DEBUG] Leitura de sensores\n");
-        printf("BMP280.pressure = %.3f kPa\n", BMP280_data.pressure);
-        printf("BMP280.temperature = %.2f C\n", BMP280_data.temperature);
-        printf("AHT20_data.temperature = %.2f C\n", AHT20_data.temperature);
-        printf("AHT20_data.humidity = %.2f %%\n", AHT20_data.humidity);
+        printf("BMP280.pressure = %.3f kPa\n", bmp_press);
+        printf("BMP280.temperature = %.2f C\n", bmp_temp);
+        printf("AHT20_data.temperature = %.2f C\n", aht_temp);
+        printf("AHT20_data.humidity = %.2f %%\n", aht_humi);
         printf("\n\n");
 
         // Strings com os valores
@@ -119,15 +139,20 @@ void core1_entry(){
         char str_offset_temp_bmp[5];
 
         // Atualizando as strings
-        sprintf(str_tmp_aht, "%.1f C", AHT20_data.temperature);
-        sprintf(str_humi_aht, "%.1f %%", AHT20_data.humidity);
-        sprintf(str_press_bmp, "%.1f kPa", BMP280_data.pressure);
-        sprintf(str_temp_bmp, "%.1f C", BMP280_data.temperature);
+        sprintf(str_tmp_aht, "%.1f C", aht_temp);
+        sprintf(str_humi_aht, "%.1f %%", aht_humi);
+        sprintf(str_press_bmp, "%.1f kPa", bmp_press);
+        sprintf(str_temp_bmp, "%.1f C", bmp_temp);
 
         sprintf(str_offset_tmp_aht, "%.1f C", config_params.AHT20_temperature.offset);
         sprintf(str_offset_humi_aht, "%.1f %%", config_params.AHT20_humidity.offset);
         sprintf(str_offset_press_bmp, "%.1f kPa", config_params.BMP280_pressure.offset);
         sprintf(str_offset_temp_bmp, "%.1f C", config_params.BMP280_temperature.offset);
+
+        // Verifica se deve acionar alerta
+        alerts_handle(&sensor_alerts, config_params, BMP280_data, AHT20_data);
+
+        ssd1306_fill(&ssd, false);
 
         switch(display_page){
             // AHT20 - Temperatura
@@ -195,10 +220,11 @@ void core1_entry(){
                 break;
         }
 
+        ssd1306_send_data(&ssd);
+
         sleep_ms(200);
     }
 }
-
 
 
 int main(){
@@ -248,21 +274,35 @@ int main(){
     gpio_pull_up(BUTTON_B);
     gpio_set_irq_enabled_with_callback(BUTTON_B, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
 
+    multicore_launch_core1(core1_entry);
+    float_u32_t conv;
     while (true) {
         // Leitura do BMP280
-        bmp280_read_raw(I2C_PORT, &raw_temp_bmp, &raw_pressure);
-        int32_t temperature = bmp280_convert_temp(raw_temp_bmp, &params);
-        int32_t pressure = bmp280_convert_pressure(raw_pressure, raw_temp_bmp, &params);
+        int32_t raw_temp, raw_press;
+        bmp280_read_raw(I2C_PORT, &raw_temp, &raw_press);
+        BMP280_data_t bmp_data;
+        bmp_data.temperature = bmp280_convert_temp(raw_temp, &params) / 100.0f;
+        bmp_data.pressure = bmp280_convert_pressure(raw_press, raw_temp, &params) / 1000.0f;
 
         // Leitura do AHT20
-        aht20_read(I2C_PORT, &AHT20_data);
+        AHT20_data_t aht_data;
+        aht20_read(I2C_PORT, &aht_data);
 
-        // Aplicando os offsets de calibração do 
-        BMP280_data.pressure = config_params.BMP280_pressure.offset + pressure/1000.0f;
-        BMP280_data.temperature = config_params.BMP280_temperature.offset + temperature/100.0f;
-        AHT20_data.humidity = config_params.AHT20_humidity.offset + AHT20_data.humidity;
-        AHT20_data.temperature= config_params.AHT20_temperature.offset + AHT20_data.temperature;
-    
+        // Aplicando os offsets de calibração
+        bmp_data.pressure = config_params.BMP280_pressure.offset + bmp_data.pressure;
+        bmp_data.temperature = config_params.BMP280_temperature.offset + bmp_data.temperature;
+        aht_data.humidity = config_params.AHT20_humidity.offset + aht_data.humidity;
+        aht_data.temperature = config_params.AHT20_temperature.offset + aht_data.temperature;
+
+        conv.f = aht_data.temperature; 
+        multicore_fifo_push_blocking(conv.u);
+        conv.f = aht_data.humidity;    
+        multicore_fifo_push_blocking(conv.u);
+        conv.f = bmp_data.pressure;    
+        multicore_fifo_push_blocking(conv.u);
+        conv.f = bmp_data.temperature; 
+        multicore_fifo_push_blocking(conv.u);
+
         sleep_ms(200);
     }
 }
