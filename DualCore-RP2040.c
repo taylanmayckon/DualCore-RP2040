@@ -153,6 +153,9 @@ void core1_entry(){
         alerts_handle(&sensor_alerts, config_params, BMP280_data, AHT20_data);
 
         ssd1306_fill(&ssd, false);
+        ssd1306_rect(&ssd, 0, 0, 128, 64, cor, !cor);
+        ssd1306_rect(&ssd, 0, 0, 128, 12, cor, cor); 
+        ssd1306_draw_string(&ssd, "DualCore", 4, 3, true);
 
         switch(display_page){
             // AHT20 - Temperatura
